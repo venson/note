@@ -2366,3 +2366,331 @@ EXPLAIN SELECT SQL_NO_CACHE * FROM student WHERE student.age=30 AND student.name
 
 ```
 
+### 3.  关联查询优化
+
+#### 3.5 小结
+
+- 保证被驱动表的JOIN字段已经创建了索引
+- 需要JOIN 的字段，数据类型保持绝对一致。
+- LEFT JOIN 时，选择小表作为驱动表， 大表作为被驱动表 。减少外层循环的次数。
+- INNER JOIN 时，MySQL会自动将 小结果集的表选为驱动表 。选择相信MySQL优化策略。
+- 能够直接多表关联的尽量直接关联，不用子查询。(减少查询的趟数)
+- 不建议使用子查询，建议将子查询SQL拆开结合程序多次查询，或使用 JOIN 来代替子查询。
+- 衍生表建不了索引
+
+## 4. 子查询优化
+
+MySQL从4.1版本开始支持子查询，使用子查询可以进行SELECT语句的嵌套查询，即一个SELECT查询的结果作为另一个SELECT语句的条件。 子查询可以一次性完成很多逻辑上需要多个步骤才能完成的SQL操作 。
+
+**子查询是 MySQL 的一项重要的功能，可以帮助我们通过一个 SQL 语句实现比较复杂的查询。但是，子查询的执行效率不高。**原因：
+
+① 执行子查询时，MySQL需要为内层查询语句的查询结果 `建立一个临时表` ，然后外层查询语句从临时表中查询记录。查询完毕后，再 撤销这些临时表 。这样会消耗过多的CPU和IO资源，产生大量的慢查询。
+
+② 子查询的结果集存储的临时表，不论是内存临时表还是磁盘临时表都 不会存在索引 ，所以查询性能会受到一定的影响。
+
+③ 对于返回结果集比较大的子查询，其对查询性能的影响也就越大。
+
+**在MySQL中，可以使用连接（JOIN）查询来替代子查询。**连接查询 不需要建立临时表 ，其 速度比子查询 
+
+要快 ，如果查询中使用索引的话，性能就会更好。
+
+```sql
+#查询班长的信息, 子查询方式
+EXPLAIN SELECT * FROM student stu1
+WHERE stu1.`stuno` IN (
+SELECT monitor
+FROM class c
+WHERE monitor IS NOT NULL
+);
+# 推荐:多表查询
+EXPLAIN SELECT stu1.* FROM student stu1 JOIN class c 
+ON stu1.`stuno` = c.`monitor`
+WHERE c.`monitor` IS NOT NULL;
+
+# 有改善 不明显
+```
+
+```sql
+#查询不为班长的学生信息, 子查询方式
+EXPLAIN SELECT SQL_NO_CACHE a.* 
+FROM student a 
+WHERE  a.stuno  NOT  IN (
+			SELECT monitor FROM class b 
+			WHERE monitor IS NOT NULL);
+
+# 推荐, 多表查询
+EXPLAIN SELECT SQL_NO_CACHE a.*
+FROM  student a LEFT OUTER JOIN class b 
+ON a.stuno =b.monitor
+WHERE b.monitor IS NULL;
+			
+```
+
+> 结论：尽量不要使用NOT IN 或者 NOT EXISTS，用LEFT JOIN xxx ON xx WHERE xx IS NULL替代
+
+## 5. 排序优化
+
+### 5.1 排序优化
+
+在MySQL 中, 支持两种排序方式, 部分鄙视FileSort和Index
+
+- index排序, 索引可以保证数据有序, 不需要在进行排序, 效率更高
+- FileSort一般在内存中进行, 占用cpu多, 如果待排结果比较大, 会产生零食文建I/O到磁盘进行排序, 效率较低
+
+**优化建议：**
+
+1. SQL 中，可以在 WHERE 子句和 ORDER BY 子句中使用索引，目的是在 WHERE 子句中 `避免全表扫描` ，在 ORDER BY 子句 `避免使用 FileSort 排序` 。当然，某些情况下全表扫描，或者 FileSort 排序不一定比索引慢。但总的来说，我们还是要避免，以提高查询效率。
+
+2. 尽量使用 Index 完成 ORDER BY 排序。如果 WHERE 和 ORDER BY 后面是相同的列就使用单索引列；如果不同就使用联合索引。
+
+3. 无法使用 Index 时，需要对 FileSort 方式进行调优。
+
+### 5.2 测试
+
+```sql
+#删除student和class表中的非主键索引
+CALL proc_drop_index('atguigudb2','student');
+CALL proc_drop_index('atguigudb2','class');
+
+#过程一：
+EXPLAIN SELECT SQL_NO_CACHE * FROM student ORDER BY age,classid; 
+EXPLAIN SELECT SQL_NO_CACHE * FROM student ORDER BY age,classid LIMIT 10; 
+## filesort
+
+#过程二：order by时不limit，索引失效
+#创建索引  
+CREATE  INDEX idx_age_classid_name ON student (age,classid,NAME);
+#未使用索引， 未限制字段，回表会使用更多时间，放弃使用索引
+EXPLAIN  SELECT SQL_NO_CACHE * FROM student ORDER BY age,classid; 
+# 不需要回表，使用索引
+EXPLAIN  SELECT SQL_NO_CACHE age,classid,name,id FROM student ORDER BY age,classid; 
+
+#limit使用索引， 有限回表数量可接受。
+EXPLAIN  SELECT SQL_NO_CACHE * FROM student ORDER BY age,classid LIMIT 10;  
+```
+
+练习
+
+```sql
+#创建索引age,classid,stuno
+CREATE  INDEX idx_age_classid_stuno ON student (age,classid,stuno);
+CREATE  INDEX idx_age_classid_name ON student (age,classid,NAME); 
+#以下哪些索引失效?
+EXPLAIN  SELECT * FROM student ORDER BY classid LIMIT 10; #失效
+EXPLAIN  SELECT * FROM student ORDER BY classid,NAME LIMIT 10; #失效  
+EXPLAIN  SELECT * FROM student ORDER BY age,classid,stuno LIMIT 10; #有效 
+EXPLAIN  SELECT * FROM student ORDER BY age,classid LIMIT 10;#有效
+EXPLAIN  SELECT * FROM student ORDER BY age LIMIT 10;# 有效
+#过程四：order by时规则不一致, 索引失效 （顺序错，不索引；方向反，不索引）
+EXPLAIN  SELECT * FROM student ORDER BY age DESC, classid ASC LIMIT 10; #失效
+EXPLAIN  SELECT * FROM student ORDER BY classid DESC, NAME DESC LIMIT 10;#失效
+EXPLAIN  SELECT * FROM student ORDER BY age ASC,classid DESC LIMIT 10; #失效
+#全部反向backward index scan
+EXPLAIN  SELECT * FROM student ORDER BY age DESC, classid DESC LIMIT 10;#有效
+#过程五：无过滤，不索引
+#where查找结果数量不大， 有可能不使用联合索引，仅使用age，查询后直接回表。
+EXPLAIN  SELECT * FROM student WHERE age=45 ORDER BY classid; #有效
+EXPLAIN  SELECT * FROM student WHERE  age=45 ORDER BY classid,NAME; #有效
+#未使用最左侧
+EXPLAIN  SELECT * FROM student WHERE  classid=45 ORDER BY age; #失效
+#先排序， idx_age_classid_name
+EXPLAIN  SELECT * FROM student WHERE  classid=45 ORDER BY age LIMIT 10;#有效
+CREATE INDEX idx_cid ON student(classid);
+# 有索引的时候使用索引， 检索where字段，using filesort
+EXPLAIN  SELECT * FROM student WHERE  classid=45 ORDER BY age;
+```
+
+小结：
+
+```sql
+INDEX a_b_c(a,b,c) order by 能使用索引最左前缀
+- ORDER BY a
+- ORDER BY a,b
+- ORDER BY a,b,c
+- ORDER BY a DESC,b DESC,c DESC 如果WHERE使用索引的最左前缀定义为常量，则order by 能使用索引
+- WHERE a = const ORDER BY b,c
+- WHERE a = const AND b = const ORDER BY c
+- WHERE a = const ORDER BY b,c
+- WHERE a = const AND b > const ORDER BY b,c 不能使用索引进行排序
+- ORDER BY a ASC,b DESC,c DESC /* 排序不一致 */
+- WHERE g = const ORDER BY b,c /*丢失a索引*/
+- WHERE a = const ORDER BY c /*丢失b索引*/
+- WHERE a = const ORDER BY a,d /*d不是索引的一部分*/
+- WHERE a in (...) ORDER BY b,c /*对于排序来说，多个相等条件也是范围查询*/
+```
+
+### 5.3 案例实战
+
+```sql
+#实战：测试filesort和index排序
+CALL proc_drop_index('atguigudb2','student');
+# type:all filesort
+EXPLAIN SELECT SQL_NO_CACHE * FROM student WHERE age = 30 AND stuno <101000 ORDER BY NAME ;
+
+#方案一: 为了去掉filesort我们可以把索引建成
+CREATE INDEX idx_age_name ON student(age,NAME);
+# type:ref len:5, 仅使用age索引
+EXPLAIN SELECT SQL_NO_CACHE * FROM student WHERE age = 30 AND stuno <101000 ORDER BY NAME ;
+
+#方案二：
+CREATE INDEX idx_age_stuno_name ON student(age,stuno,NAME);
+# type:range len:9 filesort， 使用age，stuno两项索引，结果已经很小，filesort损失有限。
+EXPLAIN SELECT SQL_NO_CACHE * FROM student WHERE age = 30 AND stuno <101000 ORDER BY NAME ;
+
+```
+
+>结论：
+>
+>1. 两个索引同时存在，mysql自动选择最优的方案。（对于这个例子，mysql选择idx_age_stuno_name）。但是， 随着数据量的变化，选择的索引也会随之变化的 。 
+>
+>2. **当【范围条件】和【group by 或者 order by】的字段出现二选一时，优先观察条件字段的过滤数量，如果过滤的数据足够多，而需要排序的数据并不多时，优先把索引放在范围字段上。反之，亦然。**
+
+### 5.4 filesort算法：双路排序和单路排序
+
+**双路排序 （慢）**
+
+- `MySQL 4.1之前是使用双路排序 `，字面意思就是两次扫描磁盘，最终得到数据， 读取行指针和`order by列` ，对他们进行排序，然后扫描已经排序好的列表，按照列表中的值重新从列表中读取对应的数据输出
+
+- 从磁盘取排序字段，在buffer进行排序，`再从 磁盘取其他字段 `。
+
+取一批数据，要对磁盘进行两次扫描，众所周知，IO是很耗时的，所以在mysql4.1之后，出现了第二种改进的算法，就是单路排序。
+
+**单路排序 （快）**
+
+从磁盘读取查询需要的 所有列 ，按照order by列在buffer对它们进行排序，然后扫描排序后的列表进行输出， 它的效率更快一些，避免了第二次读取数据。并且把随机IO变成了顺序IO，但是它会使用更多的空间， 因为它把每一行都保存在内存中了。
+
+**结论及引申出的问题**
+
+- 由于单路是后出的，总体而言好过双路
+- 但是用单路有问题
+  - 在sort_buffer中，单路比多路要占用很多空间， 因为单路是把所有字段都取出，有可能去除的数据的总数超出了sort_buffer的容量， 导致每次只能取sort_buffer容量大小的数据，并进行排列（创建tmp文件，多路合并），排完再取sort_buffer容量大小的数据排序，直至完成。需要多次IO
+  - 单路本来想节省I/O操作，反而得不偿失。
+
+**优化策略**
+
+1. **尝试提高 sort_buffer_size **
+
+   默认1M
+
+   ```sql
+   SHOW VARIABLES LIKE ‘%sort_buffer_size%';
+   +-------------------------+---------+
+   | Variable_name           | Value   |
+   +-------------------------+---------+
+   | innodb_sort_buffer_size | 1048576 |
+   | myisam_sort_buffer_size | 8388608 |
+   | sort_buffer_size        | 262144  |
+   +-------------------------+---------+
+   3 rows in set (0.00 sec)
+   ```
+
+2. **尝试提高 max_length_for_sort_data** 
+
+   - 提高这个参数，会增加用改进算法的概率。
+
+     ```sql
+     SHOW VARIABLES LIKE ‘%max_length_for_sort_data%';
+     ```
+
+   - 如果设的太高， 数据总容量超出sort_buffer_size的概率就增大， 明显症状就是高磁盘I/O和低处理器使用率。如果需要返回的列的总长度大于max_length_for_sort_data，使用双路算法， 否则使用单路算法，1024-8192字节之间调整。
+
+     
+
+3. **Order by 时select  * 是一个大忌。最好只Query需要的字段。**
+
+- 当Query的字段大小总和小于max_length_for_sort_data，而且排序字段不是TEXT|BLOB时，会用改进后的算法——单路排序，否则用老算法——多路排序
+- 两种算法的数据都有可能超出sort_buffer_size的容量，超出之后，会创建tmp文件进行合并排序，导致多次I/O，但是用单路排序算法的风险会更大一些，所以要提高sort_buffer_size。
+
+## 6. GROUP BY**优化**
+
+- group by 使用索引的原则几乎跟order by一致 ，group by 即使没有过滤条件用到索引，也可以直接使用索引。
+
+- group by 先排序再分组，遵照索引建的最佳左前缀法则
+
+- 当无法使用索引列，增大 `max_length_for_sort_data` 和 `sort_buffer_size` 参数的设置
+
+- where效率高于having，能写在where限定的条件就不要写在having中了
+
+- **减少使用order by，和业务沟通能不排序就不排序，或将排序放到程序端去做**。Order by、group by、distinct这些语句较为耗费CPU，数据库的CPU资源是极其宝贵的。
+
+- 包含了order by、group by、distinct这些查询的语句，where条件过滤出来的结果集请保持在1000行以内，否则SQL会很慢。
+
+## 7. **优化分页查询**
+
+一般分页查询时，通过创建覆盖索引能够比较好的提升性能。一个常见又非常头疼的问题就是limit 200000,10，此时需要MySQL排序前200010行记录， 仅返回200000-200010的记录，其他记录丢弃，查询排序的代价非常大。
+
+优化思路1
+
+在索引上完成排序分页操作，最后根据主键关联回原表查询所需要的其他列内容。
+
+```sql
+EXPLAIN SELECT * FROM student t,(SELECT id FROM student ORDER BY id LIMIT 2000000,10) aWHERE t.id = a.id;
+```
+
+优化思路2
+
+该方案适用于主键自增的表，可以把Limit 查询转换成某个位置的查询 。 
+
+```sql
+#主键自增
+EXPLAIN SELECT * FROM student WHERE id > 2000000 LIMIT 10;
+```
+
+## 8. 优先考虑覆盖索
+
+#### 8.1 **什么是覆盖索引？**
+
+**理解方式一**：索引是高效找到行的一个方法，但是一般数据库也能使用索引找到一个列的数据，因此它不必读取整个行。毕竟索引叶子节点存储了它们索引的数据；当能通过读取索引就可以得到想要的数据，那就不需要读取行了。**一个索引包含了满足查询结果的数据就叫做覆盖索引。**
+
+**理解方式二**：非聚簇复合索引的一种形式，它包括在查询里的SELECT、JOIN和WHERE子句用到的所有列（即建索引的字段正好是覆盖查询条件中所涉及的字段）。
+
+简单说就是， 索引列+主键 包含 SELECT 到 FROM之间查询的列 。 
+
+```sql
+#删除之前的索引
+#举例1：
+DROP INDEX idx_age_stuno ON student;
+CREATE INDEX idx_age_name ON student (age,NAME);
+# 因需要回表，综合成本高，未使用索引
+EXPLAIN SELECT * FROM student WHERE age <> 20;
+# 使用索引，覆盖索引,省去回表
+EXPLAIN SELECT age,NAME FROM student WHERE age <> 20;
+#举例2：
+# 因需要回表，综合成本高，未使用索引
+EXPLAIN SELECT * FROM student WHERE NAME LIKE '%abc';
+# 使用索引，覆盖索引,省去回表
+EXPLAIN SELECT id,age FROM student WHERE NAME LIKE '%abc';
+```
+
+
+
+
+
+
+
+#### 8.2 覆盖索引的利弊
+
+**好处：**
+
+1. **避免Innodb表进行索引的二次查询（回表）**
+
+   在二级索引中获得所要的数据，避免对主键的二次查询，减少了IO操作
+
+2. **可以把随机IO变成顺序IO加快查询效率**
+
+   覆盖索引按键值顺序存储，对于IO密集型的范围查找来说，将随机读取IO变为顺序IO
+
+**由于覆盖索引可以减少数的搜索次数，显著提升查询性能，所以覆盖索引是一个常用的性能优化手段。**
+
+**弊端：**
+
+`索引字段的维护` 总是有代价的。因此，在建立冗余索引来支持覆盖索引时就需要权衡考虑了。这是业务DBA，或者称为业务数据架构师的工作。
+
+## 9. **如何给字符串添加索引**
+
+有一张教师表，表定义如下：
+
+```sql
+create table teacher( ID bigint unsigned primary key, email varchar(64), ... )engine=innodb;
+```
+
